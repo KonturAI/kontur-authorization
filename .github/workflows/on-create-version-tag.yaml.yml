@@ -1,0 +1,274 @@
+name: Update version tag on test server
+
+on:
+    create:
+        tags:
+            - 'v*'
+
+env:
+    SERVICE_NAME: loom-authorization
+
+jobs:
+    update-tag-on-server:
+        runs-on: self-hosted
+        if: github.event.ref_type == 'tag'
+
+        steps:
+            -   name: Extract tag name
+                run: |
+                    # Извлекаем имя тега из ref
+                    TAG_NAME=${GITHUB_REF#refs/tags/}
+                    echo "TAG_NAME=$TAG_NAME" >> $GITHUB_ENV
+                    echo "✅ Обрабатываем тег: $TAG_NAME"
+
+            -   name: Load server configuration
+                run: |
+                    if [ ! -f "/root/.env.servers" ]; then
+                      echo "❌ Файл конфигурации серверов .env.servers не найден!"
+                      exit 1
+                    fi
+
+                    # Загружаем переменные окружения из .env.servers
+                    set -a
+                    source /root/.env.servers
+                    set +a
+
+                    # Проверяем наличие API конфигурации
+                    if [ -z "$LOOM_RELEASE_TG_BOT_API_URL" ] || [ -z "$LOOM_INTERSERVER_SECRET_KEY" ]; then
+                      echo "❌ API конфигурация не найдена в .env.servers!"
+                      echo "   Убедитесь, что есть переменные: LOOM_RELEASE_TG_BOT_API_URL и LOOM_INTERSERVER_SECRET_KEY"
+                      exit 1
+                    fi
+
+                    # Формируем имена переменных для тестового сервера
+                    HOST_VAR="STAGE_HOST"
+                    PASSWORD_VAR="STAGE_PASSWORD"
+
+                    # Получаем значения переменных
+                    eval "SERVER_HOST=\$$HOST_VAR"
+                    eval "SERVER_PASSWORD=\$$PASSWORD_VAR"
+
+                    if [ -z "$SERVER_HOST" ] || [ -z "$SERVER_PASSWORD" ]; then
+                      echo "❌ Конфигурация stage сервера не найдена!"
+                      echo "   Убедитесь, что в .env.servers есть переменные: ${HOST_VAR} и ${PASSWORD_VAR}"
+                      exit 1
+                    fi
+
+                    # Экспортируем все необходимые переменные
+                    echo "LOOM_RELEASE_TG_BOT_API_URL=$LOOM_RELEASE_TG_BOT_API_URL" >> $GITHUB_ENV
+                    echo "LOOM_INTERSERVER_SECRET_KEY=$LOOM_INTERSERVER_SECRET_KEY" >> $GITHUB_ENV
+                    echo "SERVER_HOST=$SERVER_HOST" >> $GITHUB_ENV
+                    echo "SERVER_PASSWORD=$SERVER_PASSWORD" >> $GITHUB_ENV
+                    echo "✅ Конфигурация загружена успешно"
+                    echo "✅ API URL: $LOOM_RELEASE_TG_BOT_API_URL"
+                    echo "✅ Stage сервер: $SERVER_HOST"
+
+            -   name: Create release record
+                run: |
+                    # Создаем запись о релизе в базе данных
+                    RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+                          -H "Content-Type: application/json" \
+                          -d '{
+                            "service_name": "${{ env.SERVICE_NAME }}",
+                            "release_version": "${{ env.TAG_NAME }}",
+                            "status": "initiated",
+                            "initiated_by": "${{ github.actor }}",
+                            "github_run_id": "${{ github.run_id }}",
+                            "github_action_link": "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}",
+                            "github_ref": "${{ github.ref }}"
+                          }' \
+                          "${{ env.LOOM_RELEASE_TG_BOT_API_URL }}/release")
+                    
+                    HTTP_CODE=$(echo "$RESPONSE" | tail -n1)
+                    BODY=$(echo "$RESPONSE" | head -n -1)
+                    
+                    if [ "$HTTP_CODE" -ne 201 ]; then
+                      echo "❌ Не удалось создать запись о релизе. HTTP код: $HTTP_CODE"
+                      echo "Ответ: $BODY"
+                      exit 1
+                    fi
+                    
+                    # Извлекаем ID релиза из ответа
+                    RELEASE_ID=$(echo "$BODY" | grep -o '"release_id":[0-9]*' | sed 's/"release_id"://')
+                    echo "RELEASE_ID=$RELEASE_ID" >> $GITHUB_ENV
+                    echo "✅ Создана запись о релизе с ID: $RELEASE_ID"
+
+            -   name: Update status to building
+                run: |
+                    curl -s -X PATCH \
+                      -H "Content-Type: application/json" \
+                      -d '{
+                        "release_id": ${{ env.RELEASE_ID }},
+                        "status": "building"
+                      }' \
+                      "${{ env.LOOM_RELEASE_TG_BOT_API_URL }}/release"
+                    echo "✅ Статус обновлен на 'building'"
+
+            -   name: Update tag on test server
+                id: deploy_step
+                run: |
+                    # Используем sshpass для аутентификации по паролю
+                    SSH_OUTPUT=$(sshpass -p "${{ env.SERVER_PASSWORD }}" ssh -o StrictHostKeyChecking=no root@${{ env.SERVER_HOST }} -p 22 << 'EOF' 2>&1
+                    set -e
+
+                    # Создаем директорию для логов если её нет
+                    mkdir -p /var/log/deployments/${{ env.SERVICE_NAME }}
+                    
+                    # Создаем файл лога с именем тега
+                    LOG_FILE="/var/log/deployments/${{ env.SERVICE_NAME }}/${{ env.TAG_NAME }}.log"
+                    
+                    # Функция для логирования
+                    log_message() {
+                        local message="$1"
+                        echo "$(date '+%Y-%m-%d %H:%M:%S') - $message" | tee -a "$LOG_FILE"
+                    }
+                    
+                    log_message "🚀 Начинаем деплой тега ${{ env.TAG_NAME }}"
+
+                    cd loom/${{ env.SERVICE_NAME }}
+                    log_message "📥 Обновляем репозиторий и теги"
+                    
+                    # Сохраняем текущую ветку/тег для проверки
+                    CURRENT_REF=$(git symbolic-ref --short HEAD 2>/dev/null || git describe --tags --exact-match 2>/dev/null || git rev-parse --short HEAD)
+                    log_message "🔍 Текущее состояние: $CURRENT_REF"
+                    
+                    if git tag -l | grep -q "^${{ env.TAG_NAME }}$"; then
+                        log_message "🏷️ Локальный тег ${{ env.TAG_NAME }} уже существует, удаляем для обновления"
+                        git tag -d ${{ env.TAG_NAME }} 2>&1 | tee -a "$LOG_FILE"
+                    fi
+                    
+                    log_message "📥 Получаем обновления из удаленного репозитория"
+                    git fetch origin 2>&1 | tee -a "$LOG_FILE"
+                    
+                    log_message "📥 Принудительно обновляем теги"
+                    git fetch origin --tags --force 2>&1 | tee -a "$LOG_FILE"
+                    
+                    # Проверяем, что тег теперь доступен
+                    if ! git tag -l | grep -q "^${{ env.TAG_NAME }}$"; then
+                        log_message "❌ Тег ${{ env.TAG_NAME }} не найден в репозитории после обновления!"
+                        log_message "📋 Доступные теги:"
+                        git tag -l | tail -10 | tee -a "$LOG_FILE"
+                        exit 1
+                    fi
+                    
+                    log_message "✅ Тег ${{ env.TAG_NAME }} найден и готов к использованию"
+
+                    # Переключаемся на тег
+                    log_message "🏷️ Переключаемся на тег ${{ env.TAG_NAME }}"
+                    git checkout ${{ env.TAG_NAME }} 2>&1 | tee -a "$LOG_FILE"
+
+                    # Очищаем старые ветки (кроме main/master)
+                    log_message "🧹 Очищаем старые ветки"
+                    git for-each-ref --format='%(refname:short)' refs/heads | grep -v -E "^(main|master)$" | xargs -r git branch -D 2>&1 | tee -a "$LOG_FILE"
+
+                    # Очищаем удаленные ветки
+                    log_message "🧹 Очищаем удаленные ветки"
+                    git remote prune origin 2>&1 | tee -a "$LOG_FILE"
+
+                    log_message "✅ Переключение на тег ${{ env.TAG_NAME }} завершено"
+
+                    cd ../loom-system
+
+                    export $(cat env/.env.app env/.env.db env/.env.monitoring | xargs)
+
+                    log_message "🔨 Начинаем сборку контейнера для тега ${{ env.TAG_NAME }}..."
+                    docker compose -f ./docker-compose/app.yaml up -d --build ${{ env.SERVICE_NAME }} 2>&1 | tee -a "$LOG_FILE"
+
+                    check_health() {
+                        # Если есть HTTP endpoint
+                        if curl -f -s -o /dev/null -w "%{http_code}" http://localhost:8001/api/authorization/health | grep -q "200"; then
+                            return 0
+                        else
+                            return 1
+                        fi
+                    }
+
+                    MAX_ATTEMPTS=3
+                    ATTEMPT=1
+                    SUCCESS=false
+
+                    log_message "⏳ Ожидание запуска сервиса..."
+                    sleep 10
+
+                    while [ $ATTEMPT -le $MAX_ATTEMPTS ]; do
+                        log_message "🔍 Проверка health (попытка $ATTEMPT из $MAX_ATTEMPTS)..."
+
+                        if check_health; then
+                            log_message "✅ Health check пройден!"
+                            SUCCESS=true
+                            break
+                        else
+                            log_message "⏳ Health check не пройден, ждем..."
+                            sleep 15
+                        fi
+
+                        ATTEMPT=$((ATTEMPT + 1))
+                    done
+
+                    if [ "$SUCCESS" = false ]; then
+                        log_message "❌ Health check не пройден после $MAX_ATTEMPTS попыток"
+                        log_message "📋 Логи контейнера:"
+                        docker logs --tail 50 ${{ env.SERVICE_NAME }} 2>&1 | tee -a "$LOG_FILE"
+                        exit 1
+                    fi
+
+                    log_message "✅ Тег ${{ env.TAG_NAME }} успешно развернут и приложение работает!"
+                    log_message "📁 Лог деплоя сохранен в: $LOG_FILE"
+                    
+                    # Выводим последние строки лога для GitHub Actions
+                    echo "📋 Последние строки лога деплоя:"
+                    tail -20 "$LOG_FILE"
+                    EOF
+                    )
+
+                    SSH_EXIT_CODE=$?
+                    
+                    if [ $SSH_EXIT_CODE -ne 0 ]; then
+                        echo "❌ Ошибка при деплое на тестовый сервер:"
+                        echo "$SSH_OUTPUT"
+                        exit 1
+                    fi
+                    
+                    echo "✅ Деплой завершен успешно"
+
+            - name: Update status on failure
+              if: failure()
+              run: |
+                curl -s -X PATCH \
+                  -H "Content-Type: application/json" \
+                  -d '{
+                    "release_id": ${{ env.RELEASE_ID }},
+                    "status": "staging_failed"
+                  }' \
+                  "${{ env.LOOM_RELEASE_TG_BOT_API_URL }}/release"
+                echo "✅ Статус обновлен на 'staging_failed'"
+
+            -   name: Update status to manual testing
+                if: success()
+                run: |
+                    curl -s -X PATCH \
+                      -H "Content-Type: application/json" \
+                      -d '{
+                        "release_id": ${{ env.RELEASE_ID }},
+                        "status": "manual_testing"
+                      }' \
+                      "${{ env.LOOM_RELEASE_TG_BOT_API_URL }}/release"
+                    echo "✅ Статус обновлен на 'manual_testing'"
+
+            -   name: Verify deployment
+                if: success()
+                run: |
+                    echo "🎉 Деплой тега ${{ env.TAG_NAME }} завершен успешно"
+                    echo "📊 Сервер: ${{ env.SERVER_HOST }}"
+                    echo "🏷️ Версия: ${{ env.TAG_NAME }}"
+                    echo "🧪 Статус: Готов к ручному тестированию"
+                    echo "📁 Лог деплоя: /var/log/deployments/${{ env.TAG_NAME }}.log"
+
+            -   name: Handle deployment failure
+                if: failure()
+                run: |
+                    echo "❌ Деплой завершился с ошибкой"
+                    echo "📊 Сервер: ${{ env.SERVER_HOST }}"
+                    echo "🏷️ Версия: ${{ env.TAG_NAME }}"
+                    echo "📋 Проверьте логи выше для подробной информации"
+                    echo "📁 Лог деплоя: /var/log/deployments/${{ env.TAG_NAME }}.log"
